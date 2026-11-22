@@ -396,3 +396,304 @@ class LogoutTests(TestCase):
         self.assertRedirects(response, reverse('login_page'),
                              fetch_redirect_response=False)
         self.assertNotIn('_auth_user_id', self.client.session)
+
+
+import tempfile
+from django.contrib.auth import authenticate
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
+
+from .models import (FeedbackStaff, FeedbackStudent, LeaveReportStaff,
+                     LeaveReportStudent, LeaveStatus, NotificationStaff)
+from .services import ProfileImageStorage
+from .staff_views import parse_scores
+
+
+class RefactoredBehaviorTests(TestCase):
+    """Unit and integration tests covering refactored domain models, services, and bug fixes."""
+
+    TINY_GIF = (
+        b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!"
+        b"\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00"
+        b"\x00\x02\x02D\x01\x00;"
+    )
+
+    def setUp(self):
+        self.session = Session.objects.create(
+            start_year=datetime.date(2026, 1, 1), end_year=datetime.date(2026, 12, 31)
+        )
+        self.course = Course.objects.create(name="CS")
+        self.hod_user = make_user("hod.ref@example.com", "1")
+        self.staff_user = make_user("staff.ref@example.com", "2")
+        self.staff_user.first_name = "Alan"
+        self.staff_user.last_name = "Turing"
+        self.staff_user.fcm_token = "tok-123"
+        self.staff_user.save()
+        self.staff = Staff.objects.get(admin=self.staff_user)
+        self.staff.course = self.course
+        self.staff.save()
+
+        self.student_user = make_user("stu.ref@example.com", 3)
+        self.student_user.first_name = "Ada"
+        self.student_user.last_name = "Lovelace"
+        self.student_user.save()
+        self.student = Student.objects.get(admin=self.student_user)
+        self.student.course = self.course
+        self.student.session = self.session
+        self.student.save()
+
+        self.subject = Subject.objects.create(
+            name="Algorithms", staff=self.staff, course=self.course
+        )
+
+    def test_post_save_signal_handles_int_and_str_user_types_and_db_reload(self):
+        self.assertTrue(Staff.objects.filter(admin=self.staff_user).exists())
+        self.assertTrue(Student.objects.filter(admin=self.student_user).exists())
+
+        reloaded = CustomUser.objects.get(pk=self.staff_user.pk)
+        self.assertEqual(reloaded.user_type, "2")
+        reloaded.first_name = "Grace"
+        reloaded.save()
+        self.assertEqual(CustomUser.objects.get(pk=reloaded.pk).first_name, "Grace")
+
+    def test_email_backend_via_django_authenticate_and_dologin_redirects(self):
+        with self.settings(RECAPTCHA_SECRET_KEY=""):
+            authed = authenticate(
+                None, username=self.staff_user.email, password="Passw0rd!"
+            )
+            self.assertEqual(authed, self.staff_user)
+
+            for user, target in [
+                (self.hod_user, "admin_home"),
+                (self.staff_user, "staff_home"),
+                (self.student_user, "student_home"),
+            ]:
+                self.client.logout()
+                response = self.client.post(
+                    reverse("user_login"),
+                    {"email": user.email, "password": "Passw0rd!"},
+                )
+                self.assertRedirects(
+                    response, reverse(target), fetch_redirect_response=False
+                )
+
+    def test_hide_delegate_properties_on_profiles_and_attendance_report(self):
+        attendance = Attendance.objects.create(
+            session=self.session, subject=self.subject, date=datetime.date(2026, 10, 1)
+        )
+        report = AttendanceReport.objects.create(
+            student=self.student, attendance=attendance, status=True
+        )
+        self.assertEqual(self.staff.full_name, "Turing Alan")
+        self.assertEqual(self.staff.email, self.staff_user.email)
+        self.assertEqual(self.staff.fcm_token, "tok-123")
+        self.assertEqual(self.staff.user_id, self.staff_user.id)
+        self.assertEqual(report.student_full_name, "Lovelace Ada")
+        self.assertEqual(report.student_user_id, self.student_user.id)
+
+    def test_leave_apply_decision_and_feedback_save_reply(self):
+        leave = LeaveReportStaff.objects.create(
+            staff=self.staff, date="2026-10-10", message="Medical"
+        )
+        self.assertEqual(leave.status, LeaveStatus.PENDING)
+        leave.apply_decision("1")
+        leave.refresh_from_db()
+        self.assertEqual(leave.status, LeaveStatus.APPROVED)
+        leave.apply_decision("invalid")
+        leave.refresh_from_db()
+        self.assertEqual(leave.status, LeaveStatus.REJECTED)
+
+        fb = FeedbackStaff.objects.create(staff=self.staff, feedback="Need projector")
+        fb.save_reply("Approved")
+        fb.refresh_from_db()
+        self.assertEqual(fb.reply, "Approved")
+
+    def test_parse_scores_bounds_and_validation(self):
+        self.assertEqual(parse_scores("35", "55.5"), (35.0, 55.5))
+        for bad_test, bad_exam in [(-1, 10), (41, 10), (10, -5), (10, 61), ("x", 10)]:
+            with self.assertRaises(ValueError):
+                parse_scores(bad_test, bad_exam)
+
+    def test_student_view_attendance_invalid_input_returns_400(self):
+        self.client.force_login(self.student_user)
+        response = self.client.post(
+            reverse("student_view_attendance"),
+            {"subject": self.subject.id, "start_date": "bad-date", "end_date": "2026-10-31"},
+        )
+        self.assertEqual(response.status_code, 400)
+
+        attendance = Attendance.objects.create(
+            session=self.session, subject=self.subject, date=datetime.date(2026, 10, 15)
+        )
+        AttendanceReport.objects.create(
+            student=self.student, attendance=attendance, status=True
+        )
+        ok_resp = self.client.post(
+            reverse("student_view_attendance"),
+            {
+                "subject": self.subject.id,
+                "start_date": "2026-10-01",
+                "end_date": "2026-10-31",
+            },
+        )
+        self.assertEqual(ok_resp.status_code, 200)
+        parsed = json.loads(json.loads(ok_resp.content))
+        self.assertEqual(parsed, [{"date": "2026-10-15", "status": True}])
+
+    def test_profile_image_storage_and_hod_crud_workflows(self):
+        self.client.force_login(self.hod_user)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with override_settings(MEDIA_ROOT=tmpdir):
+                upload = SimpleUploadedFile(
+                    "avatar.gif", self.TINY_GIF, content_type="image/gif"
+                )
+                url = ProfileImageStorage().save_and_get_url(upload)
+                self.assertTrue(url.startswith("/media/avatar"))
+                self.assertIsNone(ProfileImageStorage().save_and_get_url(None))
+
+                staff_pic = SimpleUploadedFile(
+                    "staff.gif", self.TINY_GIF, content_type="image/gif"
+                )
+                add_resp = self.client.post(
+                    reverse("add_staff"),
+                    {
+                        "first_name": "New",
+                        "last_name": "Teacher",
+                        "email": "new.teacher@example.com",
+                        "gender": "F",
+                        "password": "Passw0rd!",
+                        "address": "123 Lane",
+                        "course": self.course.id,
+                        "profile_pic": staff_pic,
+                    },
+                )
+                self.assertRedirects(
+                    add_resp, reverse("add_staff"), fetch_redirect_response=False
+                )
+                created_staff = Staff.objects.get(admin__email="new.teacher@example.com")
+                edit_resp = self.client.post(
+                    reverse("edit_staff", args=[created_staff.id]),
+                    {
+                        "first_name": "Updated",
+                        "last_name": "Teacher",
+                        "email": "new.teacher@example.com",
+                        "gender": "F",
+                        "password": "",
+                        "address": "456 Road",
+                        "course": self.course.id,
+                    },
+                )
+                self.assertRedirects(
+                    edit_resp,
+                    reverse("edit_staff", args=[created_staff.id]),
+                    fetch_redirect_response=False,
+                )
+                created_staff.admin.refresh_from_db()
+                self.assertEqual(created_staff.admin.first_name, "Updated")
+
+        course_resp = self.client.post(reverse("add_course"), {"name": "Math"})
+        self.assertRedirects(
+            course_resp, reverse("add_course"), fetch_redirect_response=False
+        )
+        math_course = Course.objects.get(name="Math")
+        edit_course_resp = self.client.post(
+            reverse("edit_course", args=[math_course.id]), {"name": "Applied Math"}
+        )
+        self.assertRedirects(
+            edit_course_resp,
+            reverse("edit_course", args=[math_course.id]),
+            fetch_redirect_response=False,
+        )
+        math_course.refresh_from_db()
+        self.assertEqual(math_course.name, "Applied Math")
+
+    def test_leave_and_feedback_workflows_end_to_end(self):
+        self.client.force_login(self.staff_user)
+        self.client.post(
+            reverse("staff_apply_leave"), {"date": "2026-11-01", "message": "Conference"}
+        )
+        self.client.post(reverse("staff_feedback"), {"feedback": "Lab upgrade"})
+        staff_leave = LeaveReportStaff.objects.get(staff=self.staff)
+        staff_fb = FeedbackStaff.objects.get(staff=self.staff)
+
+        self.client.force_login(self.student_user)
+        self.client.post(
+            reverse("student_apply_leave"), {"date": "2026-11-02", "message": "Family"}
+        )
+        self.client.post(reverse("student_feedback"), {"feedback": "More tutorials"})
+        stu_leave = LeaveReportStudent.objects.get(student=self.student)
+        stu_fb = FeedbackStudent.objects.get(student=self.student)
+
+        self.client.force_login(self.hod_user)
+        self.assertEqual(
+            self.client.post(
+                reverse("view_staff_leave"), {"id": staff_leave.id, "status": "1"}
+            ).content,
+            b"True",
+        )
+        self.assertEqual(
+            self.client.post(
+                reverse("view_student_leave"), {"id": stu_leave.id, "status": "-1"}
+            ).content,
+            b"True",
+        )
+        self.assertEqual(
+            self.client.post(
+                reverse("staff_feedback_message"), {"id": staff_fb.id, "reply": "Done"}
+            ).content,
+            b"True",
+        )
+        self.assertEqual(
+            self.client.post(
+                reverse("student_feedback_message"), {"id": stu_fb.id, "reply": "Noted"}
+            ).content,
+            b"True",
+        )
+
+        staff_leave.refresh_from_db()
+        stu_leave.refresh_from_db()
+        staff_fb.refresh_from_db()
+        stu_fb.refresh_from_db()
+        self.assertEqual(staff_leave.status, LeaveStatus.APPROVED)
+        self.assertEqual(stu_leave.status, LeaveStatus.REJECTED)
+        self.assertEqual(staff_fb.reply, "Done")
+        self.assertEqual(stu_fb.reply, "Noted")
+
+    def test_consolidated_templates_and_fixed_html_render(self):
+        self.client.logout()
+        login_html = self.client.get(reverse("login_page")).content.decode()
+        self.assertIn(
+            "https://code.ionicframework.com/ionicons/2.0.1/css/ionicons.min.css",
+            login_html,
+        )
+        self.assertNotIn("/static/https:", login_html)
+
+        LeaveReportStaff.objects.create(
+            staff=self.staff, date="2026-11-05", message="Sick", status=LeaveStatus.APPROVED
+        )
+        self.client.force_login(self.hod_user)
+        leave_html = self.client.get(reverse("view_staff_leave")).content.decode()
+        self.assertIn("Approved", leave_html)
+
+        for user, url_name in [
+            (self.hod_user, "admin_view_profile"),
+            (self.staff_user, "staff_view_profile"),
+            (self.staff_user, "staff_view_notification"),
+            (self.student_user, "student_view_profile"),
+            (self.student_user, "student_view_notification"),
+        ]:
+            self.client.force_login(user)
+            self.assertEqual(self.client.get(reverse(url_name)).status_code, 200)
+
+        with self.settings(FCM_SERVER_KEY=""):
+            self.client.force_login(self.hod_user)
+            resp = self.client.post(
+                reverse("send_staff_notification"),
+                {"id": self.staff_user.id, "message": "Meeting at 3pm"},
+            )
+            self.assertEqual(resp.content, b"True")
+            self.assertTrue(
+                NotificationStaff.objects.filter(
+                    staff=self.staff, message="Meeting at 3pm"
+                ).exists()
+            )

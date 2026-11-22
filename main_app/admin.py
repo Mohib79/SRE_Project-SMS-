@@ -1,11 +1,11 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
-from .models import *
-# Register your models here.
+
+from .models import Course, CustomUser, Session, Staff, Student, Subject
 
 
 class UserModel(UserAdmin):
-    ordering = ('email',)
+    ordering = ("email",)
 
 
 admin.site.register(CustomUser, UserModel)

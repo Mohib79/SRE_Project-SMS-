@@ -178,15 +178,13 @@
         </li>
                 <li class="nav-item">
                     {% url 'admin_view_attendance' as admin_view_attendance %}
-
-                    <li class="nav-item">
-                        <a href="{{admin_view_attendance}}" class="nav-link  {% if admin_view_attendance == request.path %} active {% endif %}">
-                            <i class="nav-icon fas fa-th"></i>
-                            <p>
-                                View Attendance
-                            </p>
-                        </a>
-                    </li>  
+                    <a href="{{admin_view_attendance}}" class="nav-link  {% if admin_view_attendance == request.path %} active {% endif %}">
+                        <i class="nav-icon fas fa-th"></i>
+                        <p>
+                            View Attendance
+                        </p>
+                    </a>
+                </li>
             <li class="nav-item">
                 {% url 'student_feedback_message' as student_feedback_message %}
 

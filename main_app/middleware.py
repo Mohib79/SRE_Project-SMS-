@@ -1,48 +1,54 @@
-from django.utils.deprecation import MiddlewareMixin
-from django.urls import reverse
 from django.contrib.auth import logout
 from django.shortcuts import redirect
+from django.urls import reverse
+from django.utils.deprecation import MiddlewareMixin
 
+from .models import UserRole
 
 # Which user_type is allowed to reach views defined in each module.
 MODULE_ROLES = {
-    'main_app.hod_views': '1',
-    'main_app.staff_views': '2',
-    'main_app.student_views': '3',
+    "main_app.hod_views": UserRole.HOD,
+    "main_app.staff_views": UserRole.STAFF,
+    "main_app.student_views": UserRole.STUDENT,
 }
 
 # Modules whose views are reachable by any authenticated user. Views in these
 # modules MUST perform their own role / ownership checks.
 SHARED_MODULES = {
-    'main_app.views',
-}
-
-ROLE_HOME = {
-    '1': 'admin_home',
-    '2': 'staff_home',
-    '3': 'student_home',
+    "main_app.views",
 }
 
 
 class LoginCheckMiddleWare(MiddlewareMixin):
+    """Enforces authentication and module-level role authorization per request."""
+
+    def _is_public_auth_request(self, request, modulename):
+        is_login_page = request.path == reverse("login_page")
+        is_auth_view = modulename == "django.contrib.auth.views"
+        is_login_submit = request.path == reverse("user_login")
+        return is_login_page or is_auth_view or is_login_submit
+
+    def _authorize_authenticated_user(self, request, modulename):
+        user = request.user
+        home = user.get_dashboard_url_name()
+        if home is None:
+            logout(request)
+            return redirect(reverse("login_page"))
+
+        required_role = MODULE_ROLES.get(modulename)
+        if required_role is not None:
+            if UserRole.normalize(user.user_type) != required_role:
+                return redirect(reverse(home))
+            return None
+
+        if modulename.startswith("main_app.") and modulename not in SHARED_MODULES:
+            return redirect(reverse(home))
+        return None
+
     def process_view(self, request, view_func, view_args, view_kwargs):
         modulename = view_func.__module__
-        user = request.user  # Who is the current user ?
-        if user.is_authenticated:
-            home = ROLE_HOME.get(user.user_type)
-            if home is None:  # Unknown role, end the session
-                logout(request)
-                return redirect(reverse('login_page'))
-            required_role = MODULE_ROLES.get(modulename)
-            if required_role is not None:
-                if user.user_type != required_role:
-                    return redirect(reverse(home))
-            elif modulename.startswith('main_app.') and modulename not in SHARED_MODULES:
-                # Deny by default: any app module that has not been explicitly
-                # mapped to a role must not be reachable.
-                return redirect(reverse(home))
-        else:
-            if request.path == reverse('login_page') or modulename == 'django.contrib.auth.views' or request.path == reverse('user_login'): # If the path is login or has anything to do with authentication, pass
-                pass
-            else:
-                return redirect(reverse('login_page'))
+        if request.user.is_authenticated:
+            return self._authorize_authenticated_user(request, modulename)
+        if not self._is_public_auth_request(request, modulename):
+            return redirect(reverse("login_page"))
+        return None

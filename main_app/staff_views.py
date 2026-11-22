@@ -2,17 +2,39 @@ import json
 
 from django.contrib import messages
 from django.core.exceptions import PermissionDenied
-from django.core.files.storage import FileSystemStorage
-from django.db import transaction
-from django.db.models import Count
-from django.http import HttpResponse, HttpResponseBadRequest, JsonResponse
-from django.shortcuts import (HttpResponseRedirect, get_object_or_404,redirect, render)
+from django.http import HttpResponse, HttpResponseBadRequest
+from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.views import View
 from django.views.decorators.http import require_POST
 
-from .forms import *
-from .models import *
+from .forms import (
+    EditResultForm,
+    FeedbackStaffForm,
+    LeaveReportStaffForm,
+    StaffEditForm,
+)
+from .models import (
+    Attendance,
+    AttendanceReport,
+    FeedbackStaff,
+    LeaveReportStaff,
+    NotificationStaff,
+    Session,
+    Staff,
+    Student,
+    StudentResult,
+    Subject,
+    UserRole,
+)
+from .services import (
+    AttendanceService,
+    UserProfileService,
+    handle_fcm_token_update,
+    handle_feedback_submission,
+    handle_leave_application,
+    legacy_json_response,
+)
 
 # Maximum scores accepted for a result (mirrors the limits used in the UI).
 MAX_TEST_SCORE = 40
@@ -21,7 +43,8 @@ MAX_EXAM_SCORE = 60
 
 def get_current_staff(request):
     """Return the Staff record of the logged in user, or deny access."""
-    if not request.user.is_authenticated or request.user.user_type != '2':
+    role = UserRole.normalize(getattr(request.user, "user_type", ""))
+    if not request.user.is_authenticated or role != UserRole.STAFF:
         raise PermissionDenied
     return get_object_or_404(Staff, admin=request.user)
 
@@ -33,283 +56,211 @@ def get_staff_subject(staff, subject_id):
 
 def parse_scores(test, exam):
     """Validate and convert test / exam scores, raising ValueError if invalid."""
-    test = float(test)
-    exam = float(exam)
-    if not (0 <= test <= MAX_TEST_SCORE) or not (0 <= exam <= MAX_EXAM_SCORE):
+    test_score = float(test)
+    exam_score = float(exam)
+    if not (0 <= test_score <= MAX_TEST_SCORE) or not (0 <= exam_score <= MAX_EXAM_SCORE):
         raise ValueError("Score out of range")
-    return test, exam
+    return test_score, exam_score
 
 
 def staff_home(request):
-    staff = get_object_or_404(Staff.objects.select_related('admin', 'course'), admin=request.user)
+    staff = get_object_or_404(
+        Staff.objects.select_related("admin", "course"), admin=request.user
+    )
     total_students = Student.objects.filter(course=staff.course).count()
     total_leave = LeaveReportStaff.objects.filter(staff=staff).count()
-    # One query for the subjects together with their attendance counts
-    subjects = list(Subject.objects.filter(staff=staff).annotate(
-        attendance_count=Count('attendance')))
-    total_subject = len(subjects)
+    subjects = staff.get_subjects_with_attendance_counts()
     subject_list = [subject.name for subject in subjects]
     attendance_list = [subject.attendance_count for subject in subjects]
-    total_attendance = sum(attendance_list)
     context = {
-        'page_title': 'Staff Panel - ' + str(staff.admin.last_name) + ' (' + str(staff.course) + ')',
-        'total_students': total_students,
-        'total_attendance': total_attendance,
-        'total_leave': total_leave,
-        'total_subject': total_subject,
-        'subject_list': subject_list,
-        'attendance_list': attendance_list
+        "page_title": f"Staff Panel - {staff.last_name} ({staff.course})",
+        "total_students": total_students,
+        "total_attendance": sum(attendance_list),
+        "total_leave": total_leave,
+        "total_subject": len(subjects),
+        "subject_list": subject_list,
+        "attendance_list": attendance_list,
     }
-    return render(request, 'staff_template/home_content.html', context)
+    return render(request, "staff_template/home_content.html", context)
 
 
 def staff_take_attendance(request):
     staff = get_object_or_404(Staff, admin=request.user)
-    subjects = Subject.objects.filter(staff_id=staff)
-    sessions = Session.objects.all()
-    context = {
-        'subjects': subjects,
-        'sessions': sessions,
-        'page_title': 'Take Attendance'
-    }
+    return render(
+        request,
+        "staff_template/staff_take_attendance.html",
+        {
+            "subjects": Subject.objects.filter(staff_id=staff),
+            "sessions": Session.objects.all(),
+            "page_title": "Take Attendance",
+        },
+    )
 
-    return render(request, 'staff_template/staff_take_attendance.html', context)
 
 @require_POST
 def get_students(request):
     staff = get_current_staff(request)
-    subject = get_staff_subject(staff, request.POST.get('subject'))
-    session = get_object_or_404(Session, id=request.POST.get('session'))
+    subject = get_staff_subject(staff, request.POST.get("subject"))
+    session = get_object_or_404(Session, id=request.POST.get("session"))
     students = Student.objects.filter(
-        course_id=subject.course_id, session=session).select_related('admin')
-    student_data = []
-    for student in students:
-        data = {
-                "id": student.id,
-                "name": student.admin.last_name + " " + student.admin.first_name
-                }
-        student_data.append(data)
-    return JsonResponse(json.dumps(student_data), content_type='application/json', safe=False)
+        course_id=subject.course_id, session=session
+    ).select_related("admin")
+    student_data = [
+        {"id": student.id, "name": student.full_name} for student in students
+    ]
+    return legacy_json_response(student_data, content_type="application/json")
 
 
 @require_POST
 def save_attendance(request):
     staff = get_current_staff(request)
-    subject = get_staff_subject(staff, request.POST.get('subject'))
-    session = get_object_or_404(Session, id=request.POST.get('session'))
-    date = request.POST.get('date')
+    subject = get_staff_subject(staff, request.POST.get("subject"))
+    session = get_object_or_404(Session, id=request.POST.get("session"))
+    date = request.POST.get("date")
     try:
-        students = json.loads(request.POST.get('student_ids') or '')
-        if not isinstance(students, list):
-            raise ValueError
-        with transaction.atomic():
-            # Check if an attendance object already exists for the given date and session
-            attendance, created = Attendance.objects.get_or_create(session=session, subject=subject, date=date)
-
-            for student_dict in students:
-                # Only students offering this subject in this session can be marked
-                student = Student.objects.get(
-                    id=student_dict.get('id'), course=subject.course, session=session)
-
-                # Check if an attendance report already exists for the student and the attendance object
-                attendance_report, report_created = AttendanceReport.objects.get_or_create(student=student, attendance=attendance)
-
-                # Update the status only if the attendance report was newly created
-                if report_created:
-                    attendance_report.status = bool(int(student_dict.get('status')))
-                    attendance_report.save()
+        AttendanceService.save_daily_attendance(
+            subject=subject,
+            session=session,
+            date=date,
+            raw_students_json=request.POST.get("student_ids"),
+            student_model=Student,
+        )
     except Exception:
         return HttpResponseBadRequest("Invalid attendance data")
-
     return HttpResponse("OK")
 
 
 def staff_update_attendance(request):
     staff = get_object_or_404(Staff, admin=request.user)
-    subjects = Subject.objects.filter(staff_id=staff)
-    sessions = Session.objects.all()
-    context = {
-        'subjects': subjects,
-        'sessions': sessions,
-        'page_title': 'Update Attendance'
-    }
-
-    return render(request, 'staff_template/staff_update_attendance.html', context)
+    return render(
+        request,
+        "staff_template/staff_update_attendance.html",
+        {
+            "subjects": Subject.objects.filter(staff_id=staff),
+            "sessions": Session.objects.all(),
+            "page_title": "Update Attendance",
+        },
+    )
 
 
 @require_POST
 def get_student_attendance(request):
     staff = get_current_staff(request)
     attendance = get_object_or_404(
-        Attendance, id=request.POST.get('attendance_date_id'), subject__staff=staff)
+        Attendance, id=request.POST.get("attendance_date_id"), subject__staff=staff
+    )
     attendance_data = AttendanceReport.objects.filter(
-        attendance=attendance).select_related('student__admin')
-    student_data = []
-    for report in attendance_data:
-        data = {"id": report.student.admin.id,
-                "name": report.student.admin.last_name + " " + report.student.admin.first_name,
-                "status": report.status}
-        student_data.append(data)
-    return JsonResponse(json.dumps(student_data), content_type='application/json', safe=False)
+        attendance=attendance
+    ).select_related("student__admin")
+    student_data = AttendanceService.serialize_student_reports_for_staff(
+        attendance_data
+    )
+    return legacy_json_response(student_data, content_type="application/json")
 
 
 @require_POST
 def update_attendance(request):
     staff = get_current_staff(request)
     attendance = get_object_or_404(
-        Attendance, id=request.POST.get('date'), subject__staff=staff)
+        Attendance, id=request.POST.get("date"), subject__staff=staff
+    )
     try:
-        students = json.loads(request.POST.get('student_ids') or '')
-        if not isinstance(students, list):
-            raise ValueError
-        with transaction.atomic():
-            for student_dict in students:
-                # Only reports belonging to this attendance can be changed
-                attendance_report = AttendanceReport.objects.get(
-                    student__admin_id=student_dict.get('id'), attendance=attendance)
-                attendance_report.status = bool(int(student_dict.get('status')))
-                attendance_report.save()
+        AttendanceService.update_daily_attendance(
+            attendance=attendance,
+            raw_students_json=request.POST.get("student_ids"),
+        )
     except Exception:
         return HttpResponseBadRequest("Invalid attendance data")
-
     return HttpResponse("OK")
 
 
 def staff_apply_leave(request):
-    form = LeaveReportStaffForm(request.POST or None)
     staff = get_object_or_404(Staff, admin_id=request.user.id)
-    context = {
-        'form': form,
-        'leave_history': LeaveReportStaff.objects.filter(staff=staff),
-        'page_title': 'Apply for Leave'
-    }
-    if request.method == 'POST':
-        if form.is_valid():
-            try:
-                obj = form.save(commit=False)
-                obj.staff = staff
-                obj.save()
-                messages.success(
-                    request, "Application for leave has been submitted for review")
-                return redirect(reverse('staff_apply_leave'))
-            except Exception:
-                messages.error(request, "Could not apply!")
-        else:
-            messages.error(request, "Form has errors!")
-    return render(request, "staff_template/staff_apply_leave.html", context)
+    return handle_leave_application(
+        request=request,
+        owner=staff,
+        owner_field="staff",
+        leave_model=LeaveReportStaff,
+        form_class=LeaveReportStaffForm,
+        template_name="staff_template/staff_apply_leave.html",
+        redirect_url_name="staff_apply_leave",
+        page_title="Apply for Leave",
+    )
 
 
 def staff_feedback(request):
-    form = FeedbackStaffForm(request.POST or None)
     staff = get_object_or_404(Staff, admin_id=request.user.id)
-    context = {
-        'form': form,
-        'feedbacks': FeedbackStaff.objects.filter(staff=staff),
-        'page_title': 'Add Feedback'
-    }
-    if request.method == 'POST':
-        if form.is_valid():
-            try:
-                obj = form.save(commit=False)
-                obj.staff = staff
-                obj.save()
-                messages.success(request, "Feedback submitted for review")
-                return redirect(reverse('staff_feedback'))
-            except Exception:
-                messages.error(request, "Could not Submit!")
-        else:
-            messages.error(request, "Form has errors!")
-    return render(request, "staff_template/staff_feedback.html", context)
+    return handle_feedback_submission(
+        request=request,
+        owner=staff,
+        owner_field="staff",
+        feedback_model=FeedbackStaff,
+        form_class=FeedbackStaffForm,
+        template_name="staff_template/staff_feedback.html",
+        redirect_url_name="staff_feedback",
+        page_title="Add Feedback",
+    )
 
 
 def staff_view_profile(request):
     staff = get_object_or_404(Staff, admin=request.user)
-    form = StaffEditForm(request.POST or None, request.FILES or None,instance=staff)
-    context = {'form': form, 'page_title': 'View/Update Profile'}
-    if request.method == 'POST':
+    form = StaffEditForm(request.POST or None, request.FILES or None, instance=staff)
+    context = {"form": form, "page_title": "View/Update Profile"}
+    if request.method == "POST":
         try:
             if form.is_valid():
-                first_name = form.cleaned_data.get('first_name')
-                last_name = form.cleaned_data.get('last_name')
-                password = form.cleaned_data.get('password') or None
-                address = form.cleaned_data.get('address')
-                gender = form.cleaned_data.get('gender')
-                passport = request.FILES.get('profile_pic') or None
-                admin = staff.admin
-                if password != None:
-                    admin.set_password(password)
-                if passport != None:
-                    fs = FileSystemStorage()
-                    filename = fs.save(passport.name, passport)
-                    passport_url = fs.url(filename)
-                    admin.profile_pic = passport_url
-                admin.first_name = first_name
-                admin.last_name = last_name
-                admin.address = address
-                admin.gender = gender
-                admin.save()
-                staff.save()
+                UserProfileService.update_user_profile(
+                    profile_instance=staff,
+                    form=form,
+                    uploaded_file=request.FILES.get("profile_pic"),
+                    update_email=False,
+                )
                 messages.success(request, "Profile Updated!")
-                return redirect(reverse('staff_view_profile'))
-            else:
-                messages.error(request, "Invalid Data Provided")
-                return render(request, "staff_template/staff_view_profile.html", context)
-        except Exception as e:
-            messages.error(
-                request, "Error Occured While Updating Profile " + str(e))
-            return render(request, "staff_template/staff_view_profile.html", context)
-
+                return redirect(reverse("staff_view_profile"))
+            messages.error(request, "Invalid Data Provided")
+        except Exception as exc:
+            messages.error(request, "Error Occured While Updating Profile " + str(exc))
     return render(request, "staff_template/staff_view_profile.html", context)
 
 
 def staff_fcmtoken(request):
-    token = request.POST.get('token')
-    try:
-        staff_user = get_object_or_404(CustomUser, id=request.user.id)
-        staff_user.fcm_token = token
-        staff_user.save()
-        return HttpResponse("True")
-    except Exception as e:
-        return HttpResponse("False")
+    return handle_fcm_token_update(request)
 
 
 def staff_view_notification(request):
     staff = get_object_or_404(Staff, admin=request.user)
     notifications = NotificationStaff.objects.filter(staff=staff)
-    context = {
-        'notifications': notifications,
-        'page_title': "View Notifications"
-    }
-    return render(request, "staff_template/staff_view_notification.html", context)
+    return render(
+        request,
+        "staff_template/staff_view_notification.html",
+        {"notifications": notifications, "page_title": "View Notifications"},
+    )
 
 
 def staff_add_result(request):
     staff = get_current_staff(request)
-    subjects = Subject.objects.filter(staff=staff)
-    sessions = Session.objects.all()
     context = {
-        'page_title': 'Result Upload',
-        'subjects': subjects,
-        'sessions': sessions
+        "page_title": "Result Upload",
+        "subjects": Subject.objects.filter(staff=staff),
+        "sessions": Session.objects.all(),
     }
-    if request.method == 'POST':
+    if request.method == "POST":
         try:
-            student_id = request.POST.get('student_list')
-            subject_id = request.POST.get('subject')
-            test, exam = parse_scores(request.POST.get('test'), request.POST.get('exam'))
-            # Only subjects taught by this staff, and students offering that subject
+            student_id = request.POST.get("student_list")
+            subject_id = request.POST.get("subject")
+            test_score, exam_score = parse_scores(
+                request.POST.get("test"), request.POST.get("exam")
+            )
             subject = Subject.objects.get(id=subject_id, staff=staff)
             student = Student.objects.get(id=student_id, course=subject.course)
-            data, created = StudentResult.objects.get_or_create(
-                student=student, subject=subject, defaults={'test': test, 'exam': exam})
-            if created:
-                messages.success(request, "Scores Saved")
-            else:
-                data.exam = exam
-                data.test = test
-                data.save()
-                messages.success(request, "Scores Updated")
-        except Exception as e:
+            _, created = StudentResult.save_or_update_score(
+                student=student,
+                subject=subject,
+                test_score=test_score,
+                exam_score=exam_score,
+            )
+            messages.success(request, "Scores Saved" if created else "Scores Updated")
+        except Exception:
             messages.warning(request, "Error Occured While Processing Form")
     return render(request, "staff_template/staff_add_result.html", context)
 
@@ -318,16 +269,14 @@ def staff_add_result(request):
 def fetch_student_result(request):
     staff = get_current_staff(request)
     try:
-        subject = Subject.objects.get(id=request.POST.get('subject'), staff=staff)
-        student = Student.objects.get(id=request.POST.get('student'), course=subject.course)
+        subject = Subject.objects.get(id=request.POST.get("subject"), staff=staff)
+        student = Student.objects.get(
+            id=request.POST.get("student"), course=subject.course
+        )
         result = StudentResult.objects.get(student=student, subject=subject)
-        result_data = {
-            'exam': result.exam,
-            'test': result.test
-        }
-        return HttpResponse(json.dumps(result_data))
-    except Exception as e:
-        return HttpResponse('False')
+        return HttpResponse(json.dumps({"exam": result.exam, "test": result.test}))
+    except Exception:
+        return HttpResponse("False")
 
 
 class EditResultView(View):
@@ -340,37 +289,40 @@ class EditResultView(View):
     def get_form(self, data=None):
         form = EditResultForm(data)
         subjects = Subject.objects.filter(staff=self.staff)
-        form.fields['subject'].queryset = subjects
-        form.fields['student'].queryset = Student.objects.filter(
-            course__in=subjects.values('course'))
+        form.fields["subject"].queryset = subjects
+        form.fields["student"].queryset = Student.objects.filter(
+            course__in=subjects.values("course")
+        )
         return form
 
     def get(self, request, *args, **kwargs):
-        context = {
-            'form': self.get_form(),
-            'page_title': "Edit Student's Result"
-        }
-        return render(request, "staff_template/edit_student_result.html", context)
+        return render(
+            request,
+            "staff_template/edit_student_result.html",
+            {"form": self.get_form(), "page_title": "Edit Student's Result"},
+        )
 
     def post(self, request, *args, **kwargs):
         form = self.get_form(request.POST)
-        context = {'form': form, 'page_title': "Edit Student's Result"}
+        context = {"form": form, "page_title": "Edit Student's Result"}
         if form.is_valid():
             try:
-                student = form.cleaned_data.get('student')
-                subject = form.cleaned_data.get('subject')
-                test, exam = parse_scores(form.cleaned_data.get('test'), form.cleaned_data.get('exam'))
-                # Validating: subject must be taught by this staff and the
-                # student must offer the subject
-                if subject.staff_id != self.staff.id or student.course_id != subject.course_id:
+                student = form.cleaned_data.get("student")
+                subject = form.cleaned_data.get("subject")
+                test_score, exam_score = parse_scores(
+                    form.cleaned_data.get("test"), form.cleaned_data.get("exam")
+                )
+                teaches_subject = subject.staff_id == self.staff.id
+                student_enrolled = student.course_id == subject.course_id
+                if not (teaches_subject and student_enrolled):
                     raise PermissionDenied
                 result = StudentResult.objects.get(student=student, subject=subject)
-                result.exam = exam
-                result.test = test
+                result.exam = exam_score
+                result.test = test_score
                 result.save()
                 messages.success(request, "Result Updated")
-                return redirect(reverse('edit_student_result'))
-            except Exception as e:
+                return redirect(reverse("edit_student_result"))
+            except Exception:
                 messages.warning(request, "Result Could Not Be Updated")
         else:
             messages.warning(request, "Result Could Not Be Updated")
