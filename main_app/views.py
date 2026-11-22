@@ -50,7 +50,7 @@ def doLogin(request, **kwargs):
                 return redirect('/')
         
         #Authenticate
-        user = EmailBackend.authenticate(request, username=request.POST.get('email'), password=request.POST.get('password'))
+        user = authenticate(request, username=request.POST.get('email'), password=request.POST.get('password'))
         if user != None:
             login(request, user)
             if user.user_type == '1':
