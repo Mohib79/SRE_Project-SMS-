@@ -1,68 +1,42 @@
-import json
-import requests
-from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import authenticate, login, logout
 from django.core.exceptions import PermissionDenied
-from django.http import HttpResponse, JsonResponse
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render, reverse
 from django.views.decorators.http import require_POST
 
-from .EmailBackend import EmailBackend
-from .models import Attendance, Session, Staff, Subject
-
-# Create your views here.
+from .models import Attendance, Session, Staff, Subject, UserRole
+from .services import AttendanceService, CaptchaService, legacy_json_response
 
 
 def login_page(request):
     if request.user.is_authenticated:
-        if request.user.user_type == '1':
-            return redirect(reverse("admin_home"))
-        elif request.user.user_type == '2':
-            return redirect(reverse("staff_home"))
-        else:
-            return redirect(reverse("student_home"))
-    return render(request, 'main_app/login.html')
+        dashboard = request.user.get_dashboard_url_name()
+        if dashboard:
+            return redirect(reverse(dashboard))
+    return render(request, "main_app/login.html")
 
 
-def doLogin(request, **kwargs):
-    if request.method != 'POST':
+def doLogin(request):
+    if request.method != "POST":
         return HttpResponse("<h4>Denied</h4>")
-    else:
-        #Google recaptcha (enabled when RECAPTCHA_SECRET_KEY is configured)
-        if settings.RECAPTCHA_SECRET_KEY:
-            captcha_token = request.POST.get('g-recaptcha-response')
-            captcha_url = "https://www.google.com/recaptcha/api/siteverify"
-            data = {
-                'secret': settings.RECAPTCHA_SECRET_KEY,
-                'response': captcha_token,
-                'remoteip': request.META.get('REMOTE_ADDR'),
-            }
-            # Make request
-            try:
-                captcha_server = requests.post(url=captcha_url, data=data, timeout=10)
-                response = json.loads(captcha_server.text)
-                if not response.get('success'):
-                    messages.error(request, 'Invalid Captcha. Try Again')
-                    return redirect('/')
-            except Exception:
-                messages.error(request, 'Captcha could not be verified. Try Again')
-                return redirect('/')
-        
-        #Authenticate
-        user = authenticate(request, username=request.POST.get('email'), password=request.POST.get('password'))
-        if user != None:
-            login(request, user)
-            if user.user_type == '1':
-                return redirect(reverse("admin_home"))
-            elif user.user_type == '2':
-                return redirect(reverse("staff_home"))
-            else:
-                return redirect(reverse("student_home"))
-        else:
-            messages.error(request, "Invalid details")
-            return redirect("/")
 
+    captcha_valid, captcha_error = CaptchaService.verify(request)
+    if not captcha_valid:
+        messages.error(request, captcha_error)
+        return redirect("/")
+
+    user = authenticate(
+        request,
+        username=request.POST.get("email"),
+        password=request.POST.get("password"),
+    )
+    if user is None:
+        messages.error(request, "Invalid details")
+        return redirect("/")
+
+    login(request, user)
+    return redirect(reverse(user.get_dashboard_url_name()))
 
 
 @require_POST
@@ -75,26 +49,21 @@ def logout_user(request):
 def get_attendance(request):
     # Shared by HOD (any subject) and staff (only subjects they teach).
     user = request.user
-    if not user.is_authenticated or user.user_type not in ('1', '2'):
+    role = UserRole.normalize(getattr(user, "user_type", ""))
+    if not user.is_authenticated or role not in (UserRole.HOD, UserRole.STAFF):
         raise PermissionDenied
-    subject_id = request.POST.get('subject')
-    session_id = request.POST.get('session')
-    if user.user_type == '2':
+
+    subject_id = request.POST.get("subject")
+    session_id = request.POST.get("session")
+    if role == UserRole.STAFF:
         staff = get_object_or_404(Staff, admin=user)
         subject = get_object_or_404(Subject, id=subject_id, staff=staff)
     else:
         subject = get_object_or_404(Subject, id=subject_id)
+
     session = get_object_or_404(Session, id=session_id)
     attendance = Attendance.objects.filter(subject=subject, session=session)
-    attendance_list = []
-    for attd in attendance:
-        data = {
-                "id": attd.id,
-                "attendance_date": str(attd.date),
-                "session": attd.session.id
-                }
-        attendance_list.append(data)
-    return JsonResponse(json.dumps(attendance_list), safe=False)
+    return legacy_json_response(AttendanceService.serialize_attendance_dates(attendance))
 
 
 def showFirebaseJS(request):
@@ -131,4 +100,4 @@ messaging.setBackgroundMessageHandler(function (payload) {
     return self.registration.showNotification(payload.notification.title, notificationOption);
 });
     """
-    return HttpResponse(data, content_type='application/javascript')
+    return HttpResponse(data, content_type="application/javascript")
