@@ -1,191 +1,197 @@
 from django import forms
-from django.forms.widgets import DateInput, TextInput
+from django.forms.widgets import DateInput
 
-from .models import *
+from .models import (
+    Admin,
+    Course,
+    CustomUser,
+    FeedbackStaff,
+    FeedbackStudent,
+    LeaveReportStaff,
+    LeaveReportStudent,
+    Session,
+    Staff,
+    Student,
+    StudentResult,
+    Subject,
+)
 
 
 class FormSettings(forms.ModelForm):
+    """Base ModelForm applying Bootstrap form-control styling to visible fields."""
+
     def __init__(self, *args, **kwargs):
-        super(FormSettings, self).__init__(*args, **kwargs)
-        # Here make some changes such as:
+        super().__init__(*args, **kwargs)
         for field in self.visible_fields():
-            field.field.widget.attrs['class'] = 'form-control'
+            field.field.widget.attrs["class"] = "form-control"
 
 
 class CustomUserForm(FormSettings):
+    """Shared user account fields, email uniqueness check, and profile hydration."""
+
     email = forms.EmailField(required=True)
-    gender = forms.ChoiceField(choices=[('M', 'Male'), ('F', 'Female')])
+    gender = forms.ChoiceField(choices=[("M", "Male"), ("F", "Female")])
     first_name = forms.CharField(required=True)
     last_name = forms.CharField(required=True)
     address = forms.CharField(widget=forms.Textarea)
     password = forms.CharField(widget=forms.PasswordInput)
-    widget = {
-        'password': forms.PasswordInput(),
-    }
     profile_pic = forms.ImageField()
 
     def __init__(self, *args, **kwargs):
-        super(CustomUserForm, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
+        if self.instance and self.instance.pk is not None:
+            self._populate_user_initial_fields(self.instance)
 
-        if kwargs.get('instance'):
-            instance = kwargs.get('instance').admin.__dict__
-            self.fields['password'].required = False
-            for field in CustomUserForm.Meta.fields:
-                self.fields[field].initial = instance.get(field)
-            if self.instance.pk is not None:
-                self.fields['password'].widget.attrs['placeholder'] = "Fill this only if you wish to update password"
+    def _populate_user_initial_fields(self, profile_instance):
+        user = getattr(profile_instance, "admin", profile_instance)
+        self.fields["password"].required = False
+        self.fields["profile_pic"].required = False
+        self.fields["password"].widget.attrs["placeholder"] = (
+            "Fill this only if you wish to update password"
+        )
+        for field in CustomUserForm.Meta.fields:
+            self.fields[field].initial = getattr(user, field, None)
 
-    def clean_email(self, *args, **kwargs):
-        formEmail = self.cleaned_data['email'].lower()
-        if self.instance.pk is None:  # Insert
-            if CustomUser.objects.filter(email=formEmail).exists():
-                raise forms.ValidationError(
-                    "The given email is already registered")
-        else:  # Update
-            dbEmail = self.Meta.model.objects.get(
-                id=self.instance.pk).admin.email.lower()
-            if dbEmail != formEmail:  # There has been changes
-                if CustomUser.objects.filter(email=formEmail).exists():
-                    raise forms.ValidationError("The given email is already registered")
+    def _get_existing_email(self):
+        if hasattr(self.instance, "admin"):
+            return self.instance.email.lower()
+        return (
+            CustomUser.objects.values_list("email", flat=True)
+            .get(pk=self.instance.pk)
+            .lower()
+        )
 
-        return formEmail
+    def clean_email(self):
+        form_email = self.cleaned_data["email"].lower()
+        is_insert = self.instance.pk is None
+        if is_insert:
+            if CustomUser.objects.filter(email=form_email).exists():
+                raise forms.ValidationError("The given email is already registered")
+            return form_email
+
+        if self._get_existing_email() != form_email:
+            if CustomUser.objects.filter(email=form_email).exists():
+                raise forms.ValidationError("The given email is already registered")
+        return form_email
+
+    def extract_user_data(self):
+        """Return cleaned user fields as a single dict for profile services."""
+        return {
+            "first_name": self.cleaned_data.get("first_name"),
+            "last_name": self.cleaned_data.get("last_name"),
+            "email": self.cleaned_data.get("email"),
+            "gender": self.cleaned_data.get("gender"),
+            "address": self.cleaned_data.get("address"),
+            "password": self.cleaned_data.get("password") or None,
+        }
 
     class Meta:
         model = CustomUser
-        fields = ['first_name', 'last_name', 'email', 'gender',  'password','profile_pic', 'address' ]
+        fields = [
+            "first_name",
+            "last_name",
+            "email",
+            "gender",
+            "password",
+            "profile_pic",
+            "address",
+        ]
+
+
+class ProfileEditForm(CustomUserForm):
+    """Shared base for self-service profile editing forms without role-only fields."""
+
+    class Meta(CustomUserForm.Meta):
+        fields = CustomUserForm.Meta.fields
 
 
 class StudentForm(CustomUserForm):
-    def __init__(self, *args, **kwargs):
-        super(StudentForm, self).__init__(*args, **kwargs)
-
     class Meta(CustomUserForm.Meta):
         model = Student
-        fields = CustomUserForm.Meta.fields + \
-            ['course', 'session']
+        fields = CustomUserForm.Meta.fields + ["course", "session"]
 
 
-class AdminForm(CustomUserForm):
-    def __init__(self, *args, **kwargs):
-        super(AdminForm, self).__init__(*args, **kwargs)
-
-    class Meta(CustomUserForm.Meta):
+class AdminForm(ProfileEditForm):
+    class Meta(ProfileEditForm.Meta):
         model = Admin
-        fields = CustomUserForm.Meta.fields
 
 
 class StaffForm(CustomUserForm):
-    def __init__(self, *args, **kwargs):
-        super(StaffForm, self).__init__(*args, **kwargs)
-
     class Meta(CustomUserForm.Meta):
         model = Staff
-        fields = CustomUserForm.Meta.fields + \
-            ['course' ]
+        fields = CustomUserForm.Meta.fields + ["course"]
+
+
+class StudentEditForm(ProfileEditForm):
+    class Meta(ProfileEditForm.Meta):
+        model = Student
+
+
+class StaffEditForm(ProfileEditForm):
+    class Meta(ProfileEditForm.Meta):
+        model = Staff
 
 
 class CourseForm(FormSettings):
-    def __init__(self, *args, **kwargs):
-        super(CourseForm, self).__init__(*args, **kwargs)
-
     class Meta:
-        fields = ['name']
         model = Course
+        fields = ["name"]
 
 
 class SubjectForm(FormSettings):
-
-    def __init__(self, *args, **kwargs):
-        super(SubjectForm, self).__init__(*args, **kwargs)
-
     class Meta:
         model = Subject
-        fields = ['name', 'staff', 'course']
+        fields = ["name", "staff", "course"]
 
 
 class SessionForm(FormSettings):
-    def __init__(self, *args, **kwargs):
-        super(SessionForm, self).__init__(*args, **kwargs)
-
     class Meta:
         model = Session
-        fields = '__all__'
+        fields = "__all__"
         widgets = {
-            'start_year': DateInput(attrs={'type': 'date'}),
-            'end_year': DateInput(attrs={'type': 'date'}),
+            "start_year": DateInput(attrs={"type": "date"}),
+            "end_year": DateInput(attrs={"type": "date"}),
         }
 
 
-class LeaveReportStaffForm(FormSettings):
-    def __init__(self, *args, **kwargs):
-        super(LeaveReportStaffForm, self).__init__(*args, **kwargs)
-
+class BaseLeaveReportForm(FormSettings):
     class Meta:
+        fields = ["date", "message"]
+        widgets = {
+            "date": DateInput(attrs={"type": "date"}),
+        }
+
+
+class LeaveReportStaffForm(BaseLeaveReportForm):
+    class Meta(BaseLeaveReportForm.Meta):
         model = LeaveReportStaff
-        fields = ['date', 'message']
-        widgets = {
-            'date': DateInput(attrs={'type': 'date'}),
-        }
 
 
-class FeedbackStaffForm(FormSettings):
-
-    def __init__(self, *args, **kwargs):
-        super(FeedbackStaffForm, self).__init__(*args, **kwargs)
-
-    class Meta:
-        model = FeedbackStaff
-        fields = ['feedback']
-
-
-class LeaveReportStudentForm(FormSettings):
-    def __init__(self, *args, **kwargs):
-        super(LeaveReportStudentForm, self).__init__(*args, **kwargs)
-
-    class Meta:
+class LeaveReportStudentForm(BaseLeaveReportForm):
+    class Meta(BaseLeaveReportForm.Meta):
         model = LeaveReportStudent
-        fields = ['date', 'message']
-        widgets = {
-            'date': DateInput(attrs={'type': 'date'}),
-        }
 
 
-class FeedbackStudentForm(FormSettings):
-
-    def __init__(self, *args, **kwargs):
-        super(FeedbackStudentForm, self).__init__(*args, **kwargs)
-
+class BaseFeedbackForm(FormSettings):
     class Meta:
+        fields = ["feedback"]
+
+
+class FeedbackStaffForm(BaseFeedbackForm):
+    class Meta(BaseFeedbackForm.Meta):
+        model = FeedbackStaff
+
+
+class FeedbackStudentForm(BaseFeedbackForm):
+    class Meta(BaseFeedbackForm.Meta):
         model = FeedbackStudent
-        fields = ['feedback']
-
-
-class StudentEditForm(CustomUserForm):
-    def __init__(self, *args, **kwargs):
-        super(StudentEditForm, self).__init__(*args, **kwargs)
-
-    class Meta(CustomUserForm.Meta):
-        model = Student
-        fields = CustomUserForm.Meta.fields 
-
-
-class StaffEditForm(CustomUserForm):
-    def __init__(self, *args, **kwargs):
-        super(StaffEditForm, self).__init__(*args, **kwargs)
-
-    class Meta(CustomUserForm.Meta):
-        model = Staff
-        fields = CustomUserForm.Meta.fields
 
 
 class EditResultForm(FormSettings):
-    session_list = Session.objects.all()
     session_year = forms.ModelChoiceField(
-        label="Session Year", queryset=session_list, required=True)
-
-    def __init__(self, *args, **kwargs):
-        super(EditResultForm, self).__init__(*args, **kwargs)
+        label="Session Year", queryset=Session.objects.all(), required=True
+    )
 
     class Meta:
         model = StudentResult
-        fields = ['session_year', 'subject', 'student', 'test', 'exam']
+        fields = ["session_year", "subject", "student", "test", "exam"]
